@@ -60,7 +60,7 @@ else {
 }
 
 Write-Host ""
-Write-Host "Engineering Guard v2 installed globally."
+Write-Host "Engineering Guard v4 installed globally."
 Write-Host "Plugin: $PluginTarget"
 Write-Host "Instructions: $AgentsTarget"
 Write-Host "Failure escalation: ENABLED"

@@ -15,7 +15,11 @@ type ValidationResult = {
   result: string
 }
 
+type GuardMode = "strict" | "generation"
+
 type SessionState = {
+  mode: GuardMode
+  generationPlanAccepted: boolean
   searchesPerformed: number
   filesRead: Set<string>
 
@@ -49,6 +53,16 @@ RESEARCH -> ANALYZE -> VERIFY HYPOTHESIS -> IMPLEMENT -> REVIEW DIFF -> VALIDATE
 
 Mandatory rules:
 
+TASK PROFILES:
+
+- BUG FIX / REFACTOR / BEHAVIOR CHANGE: use the strict analysis workflow.
+- TEST CASE / TEST SCRIPT / AUTOMATION SCRIPT GENERATION: use engineering_guard_generation_plan after inspecting the repository format and source information.
+
+For generation tasks, do NOT invent a fake root cause just to satisfy the guard.
+Once engineering_guard_generation_plan is accepted, batch file creation/editing is unlocked for the whole current task.
+Do not repeat the generation gate for every generated file.
+Failure escalation is disabled for normal test/script generation because individual generated tests may legitimately fail during discovery.
+
 1. Do not modify repository files immediately after the first plausible search result.
 2. Before modification, inspect the target implementation and at least one related caller, callee, test, configuration, or similar implementation.
 3. Perform at least one relevant repository search/reference lookup.
@@ -69,6 +83,23 @@ Mandatory rules:
 10. Only ask the user when required information genuinely cannot be discovered from the repository, environment, tools, or conversation.
 11. If validation fails, reconsider the root cause instead of repeatedly patching the same assumption.
 12. Keep changes minimal and avoid unrelated refactoring.
+
+AUTONOMOUS DIAGNOSIS:
+
+When a test, API call, build, compile, lint, script, or reproduction attempt fails:
+- inspect the failure output before changing code
+- first ask internally: "How can I reproduce or isolate this myself?"
+- try at least one focused diagnostic step using available tools
+- prefer the smallest reproducible command/request/test
+- inspect logs, request/response bodies, status codes, stack traces, relevant state, and nearby code when useful
+- use curl/HTTPie/Invoke-RestMethod/diagnostic commands when appropriate
+- you may create temporary diagnostic probes under .opencode/engineering-guard/probes/ before the normal modification gate is unlocked
+- do not treat temporary probes as the product fix
+- clean up temporary probes when they are no longer useful
+- only ask the user after autonomous diagnosis when user-only information, credentials, external state, business intent, or an unavailable environment is genuinely required
+- if asking the user, ask one targeted question and include what you already tried and what evidence is missing
+
+The guard should facilitate testing and diagnosis, not prevent it.
 
 FAILURE ESCALATION:
 
@@ -96,6 +127,8 @@ const sessions = new Map<string, SessionState>()
 
 function freshState(): SessionState {
   return {
+    mode: "strict",
+    generationPlanAccepted: false,
     searchesPerformed: 0,
     filesRead: new Set<string>(),
 
@@ -165,7 +198,13 @@ function shellCommand(args: any): string {
 }
 
 function exitCodeOf(output: any): number | undefined {
-  const raw = output?.metadata?.exitCode
+  const raw =
+    output?.metadata?.exitCode ??
+    output?.metadata?.exit ??
+    output?.metadata?.code ??
+    output?.exitCode ??
+    output?.exit
+
   if (raw === undefined || raw === null) return undefined
   const value = Number(raw)
   return Number.isFinite(value) ? value : undefined
@@ -268,20 +307,101 @@ function isKnownModifyingShell(command: string): boolean {
     /\bpip(?:3)?\s+install(?:\s|$)/i,
     /\bpython(?:3)?\s+-c\b.*\b(?:write|write_text|write_bytes|unlink|rename|replace|mkdir)\b/i,
     /\bnode\s+-e\b.*\b(?:writeFile|writeFileSync|unlink|rename|mkdir)\b/i,
+    /(?:^|\s)(?:curl|curl\.exe)\b.*(?:\s-o\s|\s--output(?:=|\s)|\s-O(?:\s|$)|\s--remote-name(?:\s|$))/i,
+    /(?:^|\s)(?:Invoke-WebRequest|iwr)\b.*(?:-OutFile\s+)/i,
   ]
 
   return patterns.some((pattern) => pattern.test(c))
 }
 
+function isDiagnosticCommand(command: string): boolean {
+  const c = command.trim()
+  if (!c) return false
+
+  // These commands are intended for reproduction, inspection, connectivity checks,
+  // API probing, or running an existing diagnostic/test script. Explicit file-writing
+  // forms are filtered by isKnownModifyingShell before this function is consulted.
+  const patterns = [
+    /^(?:curl|curl\.exe)(?:\s|$)/i,
+    /^(?:http|https|httpie)(?:\s|$)/i,
+    /^Invoke-(?:WebRequest|RestMethod)\b/i,
+    /^Test-NetConnection\b/i,
+    /^(?:ping|ping\.exe|tracert|traceroute|nslookup)(?:\s|$)/i,
+    /^Resolve-DnsName\b/i,
+    /^Get-NetTCPConnection\b/i,
+    /^(?:netstat|ss|lsof)(?:\s|$)/i,
+    /^openssl\s+s_client\b/i,
+    /^docker\s+(?:logs|ps|inspect)(?:\s|$)/i,
+    /^kubectl\s+(?:get|describe|logs|explain|api-resources|api-versions)(?:\s|$)/i,
+    /^(?:py|python|python3)\s+(?!-c\b)[^\s]+\.py(?:\s|$)/i,
+    /^node\s+(?!-e\b)[^\s]+\.(?:js|cjs|mjs)(?:\s|$)/i,
+    /^java\s+(?:-jar\s+)?[^\s]+(?:\s|$)/i,
+  ]
+
+  return patterns.some((pattern) => pattern.test(c))
+}
+
+const DIAGNOSTIC_PATH_FRAGMENTS = [
+  "/.opencode/engineering-guard/probes/",
+  "/.opencode/engineering_guard/probes/",
+  "/.opencode/probes/",
+]
+
+function isDiagnosticTempPath(value: string | undefined): boolean {
+  if (!value) return false
+  const normalized = "/" + normalizePath(value).replace(/^\/+/, "")
+  return DIAGNOSTIC_PATH_FRAGMENTS.some((fragment) => normalized.includes(fragment))
+}
+
+function patchPaths(patchText: string): string[] {
+  const paths: string[] = []
+  const regex = /^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+)$/gim
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(patchText)) !== null) {
+    if (match[1]?.trim()) paths.push(match[1].trim())
+  }
+  return paths
+}
+
+function directModificationIsDiagnosticProbe(tool: string, args: any): boolean {
+  if (tool === "apply_patch" || tool === "applypatch" || tool === "patch") {
+    const text = String(args?.patchText ?? args?.patch ?? "")
+    const paths = patchPaths(text)
+    return paths.length > 0 && paths.every((path) => isDiagnosticTempPath(path))
+  }
+
+  return isDiagnosticTempPath(filePathFromArgs(args))
+}
+
+function diagnosticFailureGuidance(command: string): string {
+  return [
+    "ENGINEERING GUARD: DIAGNOSTIC FAILURE OBSERVED",
+    "",
+    `The attempted diagnostic/validation command failed: ${command}`,
+    "",
+    "Before asking the user or changing code:",
+    "1. Inspect the failure output/status/stack trace/request-response details.",
+    "2. Decide how to reproduce or isolate the failure with the smallest focused test.",
+    "3. Try at least one autonomous diagnostic step using available tools.",
+    "4. Inspect relevant logs/state/code if the result is still ambiguous.",
+    "5. Change code only when evidence supports the diagnosis.",
+    "",
+    "You may use curl, HTTPie, Invoke-RestMethod, network/log inspection, existing test runners, or a temporary probe under .opencode/engineering-guard/probes/.",
+    "Only ask the user if information unavailable to the environment is genuinely required. If you ask, state what you already tried and exactly what information is missing.",
+  ].join("\n")
+}
+
 /**
  * Before analysis, unknown shell commands are conservatively treated as potentially
- * modifying. Known read-only and validation commands remain available for investigation.
+ * modifying. Read-only, validation, and diagnostic commands remain available so the
+ * agent can reproduce and investigate failures before deciding on a code change.
  */
 function shellNeedsModificationUnlock(command: string): boolean {
   if (!command.trim()) return false
+  if (isKnownModifyingShell(command)) return true
   if (isKnownReadOnlyShell(command)) return false
   if (isValidationCommand(command)) return false
-  if (isKnownModifyingShell(command)) return true
+  if (isDiagnosticCommand(command)) return false
   return true
 }
 
@@ -293,6 +413,10 @@ function filePathFromArgs(args: any): string | undefined {
     args?.filename
 
   return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function isGenerationMode(state: SessionState): boolean {
+  return state.mode === "generation"
 }
 
 function requiredSearches(state: SessionState): number {
@@ -327,6 +451,13 @@ function triggerEscalation(state: SessionState, reason: string): boolean {
 
 function missingInvestigation(state: SessionState): string[] {
   const missing: string[] = []
+
+  if (isGenerationMode(state)) {
+    if (!state.generationPlanAccepted) {
+      missing.push("call engineering_guard_generation_plan after inspecting source information and repository test/script format")
+    }
+    return missing
+  }
 
   if (state.searchesPerformed < requiredSearches(state)) {
     missing.push(
@@ -378,6 +509,7 @@ function modificationBlockedMessage(state: SessionState): string {
     "",
     "Continue autonomously using read/grep/glob/LSP/read-only shell tools.",
     "Do NOT ask the user for permission.",
+    "If this task is test-case, test-script, or automation-script generation, use engineering_guard_generation_plan instead of inventing a bug root cause.",
   )
 
   if (state.escalationLevel > 0) {
@@ -474,6 +606,15 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
 
       let requiresUnlock = DIRECT_MODIFICATION_TOOLS.has(name)
 
+      if (requiresUnlock && directModificationIsDiagnosticProbe(name, output?.args)) {
+        await log("debug", "POLICY diagnostic probe write allowed", {
+          sessionID: input.sessionID,
+          tool: name,
+          path: filePathFromArgs(output?.args),
+        })
+        return
+      }
+
       if (SHELL_TOOLS.has(name)) {
         const command = shellCommand(output?.args)
         requiresUnlock = shellNeedsModificationUnlock(command)
@@ -531,25 +672,43 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
           })
         }
 
-        if (isValidationCommand(command)) {
-          if (isSuccessful(output)) {
-            state.validationCommands.push(command)
+        const diagnosticOrValidation = isValidationCommand(command) || isDiagnosticCommand(command)
 
-            await log("debug", "POLICY validation observed", {
+        if (diagnosticOrValidation) {
+          if (isSuccessful(output)) {
+            if (isValidationCommand(command)) {
+              state.validationCommands.push(command)
+            }
+
+            await log("debug", isValidationCommand(command) ? "POLICY validation observed" : "POLICY diagnostic observed", {
               sessionID: input.sessionID,
               command,
             })
           } else {
-            state.failedValidationCommands.push(command)
+            if (isValidationCommand(command)) {
+              state.failedValidationCommands.push(command)
+            }
 
-            await log("warn", "POLICY validation failed", {
+            await log("warn", isValidationCommand(command) ? "POLICY validation failed" : "POLICY diagnostic failed", {
               sessionID: input.sessionID,
               command,
               failedValidationCount: state.failedValidationCommands.length,
               exitCode: exitCodeOf(output),
             })
 
-            if (state.failedValidationCommands.length >= 2) {
+            // Native tool results can be annotated so the next model turn is explicitly
+            // pushed toward autonomous reproduction/isolation rather than immediately
+            // asking the user or guessing a patch. Keep both output and metadata.output
+            // in sync for OpenCode versions whose TUI uses either field.
+            const guidance = diagnosticFailureGuidance(command)
+            if (typeof output?.output === "string" && !output.output.includes("DIAGNOSTIC FAILURE OBSERVED")) {
+              output.output = `${output.output}\n\n${guidance}`
+            }
+            if (typeof output?.metadata?.output === "string" && !output.metadata.output.includes("DIAGNOSTIC FAILURE OBSERVED")) {
+              output.metadata.output = `${output.metadata.output}\n\n${guidance}`
+            }
+
+            if (isValidationCommand(command) && !isGenerationMode(state) && state.failedValidationCommands.length >= 2) {
               const escalated = triggerEscalation(
                 state,
                 "Two or more validation commands failed during the current task.",
@@ -576,6 +735,15 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
       }
 
       if (DIRECT_MODIFICATION_TOOLS.has(name) && isSuccessful(output)) {
+        if (directModificationIsDiagnosticProbe(name, args)) {
+          await log("debug", "POLICY diagnostic probe written", {
+            sessionID: input.sessionID,
+            tool: name,
+            path: filePathFromArgs(args),
+          })
+          return
+        }
+
         state.modificationStarted = true
 
         const path = filePathFromArgs(args)
@@ -589,6 +757,84 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
     },
 
     tool: {
+      engineering_guard_generation_plan: tool({
+        description:
+          "Use for test-case, test-script, automation-script, fixture, or similar generation tasks. After inspecting repository conventions and source information, this unlocks batch generation without requiring bug-style root-cause analysis for every file.",
+        args: {
+          task_type: tool.schema.enum([
+            "test_case_generation",
+            "test_script_generation",
+            "automation_script_generation",
+            "fixture_generation",
+          ]),
+          target_scope: tool.schema.string().min(3),
+          source_files: tool.schema
+            .array(tool.schema.string().min(1))
+            .min(2)
+            .describe("Exact paths of source/info/framework files actually read in this session."),
+          repository_format_understood: tool.schema.string().min(10),
+          cleanup_scope: tool.schema.string().optional(),
+          generation_plan: tool.schema.array(tool.schema.string().min(3)).min(1),
+          validation_plan: tool.schema.array(tool.schema.string().min(3)).min(1),
+        },
+        async execute(args, context) {
+          const state = stateFor(context.sessionID)
+          const problems: string[] = []
+
+          if (state.searchesPerformed < 1) {
+            problems.push("At least one repository search/reference lookup is required before generation.")
+          }
+
+          if (state.filesRead.size < 2) {
+            problems.push("Read at least two relevant files: source/info plus repository format/runner/reference implementation.")
+          }
+
+          const matchedSources = args.source_files.filter((source: string) =>
+            sourceMatchesRead(source, state.filesRead),
+          )
+          const uniqueSources = new Set(matchedSources.map((source: string) => normalizePath(source)))
+
+          if (uniqueSources.size < 2) {
+            problems.push("source_files must reference at least two distinct files actually read in this session.")
+          }
+
+          if (problems.length > 0) {
+            return [
+              "ENGINEERING POLICY: GENERATION PLAN REJECTED",
+              "",
+              ...problems.map((problem) => `- ${problem}`),
+              "",
+              "Continue inspecting the repository autonomously and retry.",
+              "Do not ask the user for permission.",
+            ].join("\n")
+          }
+
+          state.mode = "generation"
+          state.generationPlanAccepted = true
+          state.analysisAccepted = true
+          state.criticAccepted = true
+          state.escalationLevel = 0
+          state.escalationReason = undefined
+
+          await log("info", "POLICY generation mode unlocked", {
+            sessionID: context.sessionID,
+            taskType: args.task_type,
+            targetScope: args.target_scope,
+            cleanupScope: args.cleanup_scope,
+            sourceFiles: [...uniqueSources],
+          })
+
+          return [
+            "ENGINEERING POLICY: GENERATION MODE UNLOCKED",
+            "",
+            "Batch test/script generation is now unlocked for the current task.",
+            "You may clean only the declared target scope and then create/edit all required generated files without repeating this gate per file.",
+            "Do not perform bug-style root-cause analysis unless a real implementation defect is discovered.",
+            "Validate the generated output at the end using the declared validation plan.",
+          ].join("\n")
+        },
+      }),
+
       engineering_guard_analysis: tool({
         description:
           "MANDATORY before repository modification. Submit an evidence-backed analysis after searching and reading relevant code. During failure escalation, stricter evidence requirements apply.",
@@ -626,6 +872,8 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
         },
         async execute(args, context) {
           const state = stateFor(context.sessionID)
+          state.mode = "strict"
+          state.generationPlanAccepted = false
           const problems: string[] = []
 
           const minSearches = requiredSearches(state)
@@ -866,7 +1114,7 @@ export const EngineeringGuardPlugin: Plugin = async ({ client }) => {
           if (problems.length > 0) {
             state.verificationRejects += 1
 
-            if (state.verificationRejects >= 2) {
+            if (!isGenerationMode(state) && state.verificationRejects >= 2) {
               const escalated = triggerEscalation(
                 state,
                 "Post-change verification was rejected two or more times.",

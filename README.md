@@ -1,341 +1,311 @@
-# OpenCode Engineering Guard
+# OpenCode Engineering Guard v4
 
-A global OpenCode plugin that prevents coding agents from jumping from the first plausible search result directly into repository modifications.
+A global OpenCode runtime guard that improves coding-agent reliability without preventing autonomous testing and diagnosis.
 
-It enforces an evidence-first engineering workflow at runtime rather than relying only on prompts.
-
-## Workflow
-
-Normal tasks:
+V4 changes the guard philosophy from:
 
 ```text
-User request
-   ↓
-Search repository
-   ↓
-Read target code
-   ↓
-Read related caller / callee / test / config
-   ↓
-engineering_guard_analysis
-   ↓
-EDIT UNLOCK
-   ↓
-Modify repository
-   ↓
-git diff
-   ↓
-Targeted test / build / lint / typecheck
-   ↓
-engineering_guard_verification
-   ↓
-Finish
+protect edits first
 ```
 
-## Failure escalation
-
-Repeated failed attempts automatically trigger a stricter mode.
-
-The current implementation escalates when either:
-
-- 2 validation commands fail during the same task, or
-- post-change verification is rejected 2 times.
-
-After escalation:
+to:
 
 ```text
-Failed attempt
-   ↓
-ESCALATION
-   ↓
-More repository searches
-   ↓
-Read more related files
-   ↓
-Re-evaluate previous root cause
-   ↓
-Stronger engineering_guard_analysis
-   ↓
-engineering_guard_critic
-   ↓
-Critic verdict?
-   ├── revise → investigate again
-   └── accept
-          ↓
-       EDIT UNLOCK
-          ↓
-       New implementation
-          ↓
-       Diff + validation
+let the agent investigate and test freely
+-> guard unsupported product changes
 ```
 
-This is designed to stop the common agent failure pattern:
+The agent should try to reproduce and diagnose a problem itself before asking the user.
+
+## Main workflows
+
+### Strict engineering mode
+
+For bug fixes, refactors and behavior changes:
 
 ```text
 search
-→ first plausible match
-→ patch
-→ test fails
-→ patch same assumption again
-→ test fails
-→ patch again
+-> inspect target + related code
+-> reproduce / probe / diagnose when useful
+-> engineering_guard_analysis
+-> product modification
+-> git diff
+-> targeted validation
+-> engineering_guard_verification
 ```
 
-Instead the agent is forced to obtain new evidence and challenge its own diagnosis.
+Unsupported product modifications are blocked, but diagnostic activity is intentionally available before the edit gate.
 
-## Escalated requirements
+### Generation mode
 
-Normal mode requires:
-
-- at least 1 repository search
-- at least 2 relevant files read
-- at least 2 evidence sources
-- at least 1 alternative hypothesis checked
-- accepted `engineering_guard_analysis`
-
-Escalated mode requires:
-
-- at least 2 repository searches
-- at least 3 relevant files read
-- at least 3 distinct evidence sources
-- at least 2 alternative hypotheses checked
-- explanation of why the previous attempt failed
-- accepted `engineering_guard_analysis`
-- accepted `engineering_guard_critic`
-
-## Runtime enforcement
-
-The plugin intercepts repository-changing tool calls.
-
-Direct modification tools such as:
+For test cases, test scripts, automation scripts and fixtures:
 
 ```text
-edit
-write
-patch
-apply_patch
+search
+-> inspect info/specification
+-> inspect framework format/runner/reference
+-> test/probe API or behavior when needed
+-> engineering_guard_generation_plan
+-> BATCH GENERATION UNLOCKED
+-> optional scoped cleanup
+-> create/edit generated files
+-> diff
+-> targeted validation
 ```
 
-are blocked until the guard requirements pass.
+The generation gate runs once per current user task, not once per generated file.
 
-Potentially modifying shell commands are also blocked before analysis.
+## Autonomous diagnosis
 
-Examples:
+When a command or test fails, V4 pushes the agent toward diagnosis instead of immediately asking the user or guessing another patch.
+
+Expected behavior:
 
 ```text
-rm
-mv
-cp
-Remove-Item
-Move-Item
-Set-Content
-git reset
-git restore
-git checkout
-git apply
-npm install
-pip install
+failure
+-> inspect output
+-> reproduce with smallest useful test
+-> inspect logs/request/response/state/code
+-> try focused diagnostic
+-> decide whether diagnosis is supported
+   ├── yes -> fix
+   └── no  -> continue investigation or ask one targeted user question
 ```
 
-Known read-only commands remain available for investigation:
+The user does not need to manually say:
 
 ```text
-git status
-git diff
-git log
-git show
-rg
-grep
-cat
-Get-Content
-Get-ChildItem
-Select-String
+try curl
+check the logs
+run the test yourself
+see if you can reproduce it
 ```
 
-Unknown shell commands are treated conservatively as potentially modifying.
+The agent is instructed to do those things first when practical.
 
-## Internal tools
+## Diagnostic commands are allowed before edit unlock
 
-The plugin exposes three tools to the model.
+V4 explicitly recognizes common diagnostic operations such as:
+
+```text
+curl / curl.exe
+HTTPie
+Invoke-WebRequest
+Invoke-RestMethod
+Test-NetConnection
+ping
+tracert / traceroute
+nslookup / Resolve-DnsName
+Get-NetTCPConnection
+netstat / ss / lsof
+openssl s_client
+docker logs / ps / inspect
+kubectl get / describe / logs
+existing Python scripts
+existing Node scripts
+existing Java/JAR diagnostic runs
+```
+
+Normal test/build/lint/typecheck commands are also available before product modification is unlocked.
+
+Explicitly mutating forms remain guarded. For example, `curl -o file` or a command using output redirection is treated as a write rather than a read-only probe.
+
+## Temporary diagnostic probes
+
+Sometimes the best way to understand a failure is to create a tiny reproduction script.
+
+V4 allows the agent to create temporary diagnostic files under:
+
+```text
+.opencode/engineering-guard/probes/
+```
+
+Example:
+
+```text
+.opencode/engineering-guard/probes/reproduce_parser_bug.py
+```
+
+These files:
+
+- can be created before the normal root-cause edit gate
+- do not count as product modifications
+- are intended only for reproduction / diagnosis
+- should be removed when no longer needed
+
+The guard still blocks arbitrary product-code edits until the appropriate analysis/generation gate passes.
+
+## Asking the user
+
+V4 does **not** forbid questions.
+
+It changes the order:
+
+```text
+BAD
+failure -> ask user what to do
+
+GOOD
+failure
+-> try to reproduce
+-> inspect evidence
+-> run focused diagnostics
+-> ask user only if required information is unavailable
+```
+
+A useful user question should explain:
+
+- what the agent already tried
+- what it observed
+- what exact missing information is needed
+
+Typical valid reasons to ask:
+
+- credentials/access only the user can provide
+- an external system is inaccessible from the environment
+- expected business behavior is ambiguous
+- required hardware/data is unavailable
+- user preference/decision is genuinely needed
+
+## Failure guidance
+
+When a diagnostic or validation shell command fails, the guard attempts to append guidance to the native tool result telling the model to:
+
+1. inspect the failure
+2. isolate/reproduce it
+3. try another focused diagnostic
+4. inspect relevant state/logs/code
+5. avoid changing code until evidence supports the diagnosis
+
+OpenCode's current plugin API supports observing tool results; behavior of rendered after-hook annotations can vary between OpenCode versions and tool types, so the same rules are also injected into the global system instructions.
+
+## Failure escalation
+
+Strict bug-fix work still supports escalation.
+
+Repeated failed validations can lead to:
+
+```text
+FAIL
+-> autonomous diagnosis
+-> FAIL again
+-> ESCALATION
+-> more searches/files/evidence
+-> stronger engineering_guard_analysis
+-> engineering_guard_critic
+-> revised implementation
+```
+
+Generation mode does not automatically escalate simply because generated test cases fail. Test failures may be part of API/data discovery and should first be diagnosed normally.
+
+## Runtime tools
 
 ### `engineering_guard_analysis`
 
-Required before repository modification.
-
-The model must provide:
-
-- root cause / technical explanation
-- evidence from files actually read in the current session
-- alternative hypotheses checked
-- affected areas
-- proposed change
-- risks
-
-During escalation it must also explain why the previous attempt failed.
+Used for real bug fixes / behavior changes before product modification.
 
 ### `engineering_guard_critic`
 
-Required only after failure escalation.
+Used after strict-mode failure escalation to challenge the revised diagnosis.
 
-The critic must review:
+### `engineering_guard_generation_plan`
 
-- weaknesses in the current diagnosis
-- alternative root causes
-- missed code areas
-- regression risks
-
-Verdict must be exactly:
-
-```text
-accept
-```
-
-or:
-
-```text
-revise
-```
-
-A `revise` verdict locks modification again and sends the agent back to investigation.
+Used once for test/script/fixture generation to unlock batch generation.
 
 ### `engineering_guard_verification`
 
-Required after repository modification.
+Used after product changes to verify diff review and actual validation.
 
-The guard checks that:
+## Installation
 
-- `git diff` was actually observed
-- claimed validation commands were actually executed
-- relevant validation succeeded or the model explicitly states why it is unavailable
-- the model confirms the solution after validation
-
-## Global installation
-
-OpenCode loads the plugin from the user's global configuration directory:
-
-```text
-~/.config/opencode/
-```
-
-On Windows this is typically:
-
-```text
-C:\Users\<username>\.config\opencode\
-```
-
-Install layout:
-
-```text
-.config/
-└── opencode/
-    ├── AGENTS.md
-    └── plugins/
-        └── engineering-guard.ts
-```
-
-## Windows installation
-
-Clone or download this repository.
-
-Open PowerShell in the repository directory:
+Windows:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\install-engineering-guard.ps1
 ```
 
-Then fully close OpenCode and start it again.
+Then fully close and restart OpenCode.
 
-The installer backs up an existing guard plugin before replacing it.
+Global install location:
 
-## Updating
+```text
+%USERPROFILE%\.config\opencode\
+├── AGENTS.md
+└── plugins\
+    └── engineering-guard.ts
+```
 
-Pull the repository and run the installer again:
+## Updating from v3
+
+Run the v4 installer from this repository:
 
 ```powershell
-git pull
 .\install-engineering-guard.ps1
 ```
+
+The installer backs up the existing plugin before replacing it.
 
 Then restart OpenCode.
 
 ## Emergency disable
-
-If a provider or OpenCode update becomes incompatible with the plugin:
 
 ```powershell
 $env:OPENCODE_ENGINEERING_GUARD = "0"
 opencode
 ```
 
-To remove the variable:
+Re-enable:
 
 ```powershell
 Remove-Item Env:OPENCODE_ENGINEERING_GUARD -ErrorAction SilentlyContinue
 ```
 
-## Basic test
+## Example: API test generation
 
-Open a repository and ask the model:
-
-```text
-Find the cause of this bug and fix it.
-```
-
-If the model attempts to modify too early, it should receive:
+Prompt:
 
 ```text
-ENGINEERING POLICY: MODIFICATION BLOCKED
+Delete the old generated test cases in the requested scope, inspect the info folder from scratch, understand the API/test framework format, test the actual API with curl/HTTPie when necessary, then regenerate and validate the requested cases.
 ```
 
-The model should continue autonomously without asking the user for permission.
-
-## Failure escalation test
-
-Use a task where the first proposed fix is intentionally wrong or where validation fails twice.
-
-After the second failed validation you should see guard logs indicating:
+Expected behavior:
 
 ```text
-POLICY failure escalation activated
+search/read
+-> curl/probe if useful
+-> engineering_guard_generation_plan
+-> GENERATION MODE UNLOCKED
+-> cleanup target scope
+-> generate many test files
+-> run cases
+-> if one fails: diagnose it autonomously
+-> continue/fix based on evidence
 ```
 
-The model should then:
-
-1. return to investigation
-2. inspect additional files
-3. submit a stronger analysis
-4. invoke `engineering_guard_critic`
-5. modify only after critic acceptance
-
-## Logging
-
-The plugin writes structured OpenCode logs such as:
+## Example: bug diagnosis
 
 ```text
-POLICY task reset
-POLICY modification blocked
-POLICY analysis accepted
-POLICY validation failed
-POLICY failure escalation activated
-POLICY critic requested revision
-POLICY critic accepted
-POLICY verification rejected
-POLICY verification accepted
+User: Fix this API client bug.
+
+Agent:
+search/read
+-> reproduce request with curl
+-> inspect status/body/logs
+-> run focused local probe
+-> engineering_guard_analysis
+-> edit
+-> targeted test
+-> verification
 ```
 
-## Repository files
+If the environment cannot reach the API, the agent may then ask a targeted question such as what network/proxy context is required, while stating the connectivity checks it already attempted.
 
-```text
-engineering-guard.ts
-AGENTS.md
-install-engineering-guard.ps1
-README.md
-LICENSE
-```
+## Files
 
-## Design principle
-
-Do not merely ask the model to be careful.
-
-Make unsafe engineering shortcuts impossible at the runtime layer.
+- `engineering-guard.ts`
+- `AGENTS.md`
+- `install-engineering-guard.ps1`
+- `README.md`
+- `CHANGELOG.md`
+- `LICENSE`
